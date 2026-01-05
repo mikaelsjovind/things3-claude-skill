@@ -151,5 +151,6 @@ All scripts return JSON:
 
 ## Reference
 
-- **`references/applescript-api.md`** - AppleScript API documentation
-- [Things URL Scheme](https://culturedcode.com/things/support/articles/2803573/)
+- **`references/url-scheme-reference.md`** - Things URL Scheme API (primary)
+- **`references/applescript-api.md`** - AppleScript API (for reading data)
+- [Official Things URL Scheme](https://culturedcode.com/things/support/articles/2803573/)

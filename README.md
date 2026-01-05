@@ -122,7 +122,10 @@ All scripts return JSON:
 
 - [Things URL Scheme Documentation](https://culturedcode.com/things/support/articles/2803573/)
 - [Things AppleScript Guide](https://culturedcode.com/things/support/articles/2803572/)
-- API documentation in `references/applescript-api.md`
+
+### Reference Files
+- `references/url-scheme-reference.md` - Complete URL Scheme API documentation
+- `references/applescript-api.md` - AppleScript API for reading data
 
 ## License
 

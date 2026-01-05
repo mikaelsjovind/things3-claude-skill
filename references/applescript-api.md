@@ -2,6 +2,22 @@
 
 Complete reference for Things 3 AppleScript commands and properties.
 
+> **Note:** This skill primarily uses AppleScript for **reading** data. For creating and updating items, see [url-scheme-reference.md](url-scheme-reference.md).
+
+## Known Limitations
+
+### activation date Property
+Setting `activation date` via AppleScript may fail with error -10006. Use Things URL Scheme with `when` parameter instead:
+```
+things:///update?auth-token=TOKEN&id=ID&when=2026-01-15
+```
+
+### Date Parsing
+AppleScript's date parsing is locale-dependent and may not reliably parse ISO format (`YYYY-MM-DD`). When working with dates, consider:
+- Using relative dates: `(current date) + (7 * days)`
+- Parsing date components manually
+- Using URL Scheme for date-based operations
+
 ## Object Types
 
 ### To Do
