@@ -28,11 +28,12 @@ urlencode() {
     python3 -c "import urllib.parse; print(urllib.parse.quote('''$1''', safe=''))"
 }
 
-# Check if it's a built-in list
+# Check if it's a built-in list (convert to lowercase for comparison)
+IDENTIFIER_LOWER=$(echo "$IDENTIFIER" | tr '[:upper:]' '[:lower:]')
 BUILTIN_LISTS="inbox today anytime upcoming someday logbook tomorrow deadlines repeating all-projects logged-projects"
 IS_BUILTIN=false
 for list in $BUILTIN_LISTS; do
-    if [ "${IDENTIFIER,,}" = "$list" ]; then
+    if [ "$IDENTIFIER_LOWER" = "$list" ]; then
         IS_BUILTIN=true
         break
     fi
@@ -40,7 +41,7 @@ done
 
 # Build URL
 if [ "$IS_BUILTIN" = true ]; then
-    URL="things:///show?id=${IDENTIFIER,,}"
+    URL="things:///show?id=${IDENTIFIER_LOWER}"
 elif [[ "$IDENTIFIER" =~ ^[A-Za-z0-9_-]{20,}$ ]]; then
     # Looks like an ID
     URL="things:///show?id=${IDENTIFIER}"
