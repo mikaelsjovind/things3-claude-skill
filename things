@@ -1,0 +1,950 @@
+#!/usr/bin/env bash
+# Things 3 CLI - Unified interface for Things 3 on macOS
+# Uses AppleScript for reading, URL scheme for writing
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTH_TOKEN_FILE="${SCRIPT_DIR}/auth-token"
+
+# =============================================================================
+# SHARED FUNCTIONS
+# =============================================================================
+
+urlencode() {
+    python3 -c "import urllib.parse; print(urllib.parse.quote('''$1''', safe=''))"
+}
+
+get_auth_token() {
+    if [ -n "${THINGS3_AUTH_TOKEN:-}" ]; then
+        echo "$THINGS3_AUTH_TOKEN"
+    elif [ -f "$AUTH_TOKEN_FILE" ]; then
+        cat "$AUTH_TOKEN_FILE" | tr -d '[:space:]'
+    else
+        echo ""
+    fi
+}
+
+json_response() {
+    local success="$1"
+    local message="$2"
+    local data="${3:-null}"
+    echo "{\"success\": $success, \"message\": \"$message\", \"data\": $data}"
+}
+
+lookup_todo_id() {
+    local identifier="$1"
+    # If it looks like an ID, use it directly
+    if [[ "$identifier" =~ ^[A-Za-z0-9_-]{20,}$ ]]; then
+        echo "$identifier"
+        return 0
+    fi
+    # Otherwise look up by name
+    osascript -e "tell application \"Things3\"
+        try
+            return id of to do \"$identifier\"
+        on error
+            set allTodos to to dos
+            repeat with t in allTodos
+                if name of t is \"$identifier\" then
+                    return id of t
+                end if
+            end repeat
+        end try
+        return \"NOT_FOUND\"
+    end tell" 2>/dev/null
+}
+
+# =============================================================================
+# TODO COMMANDS
+# =============================================================================
+
+cmd_todo_add() {
+    local title=""
+    local notes="" when="" deadline="" tags="" list="" checklist="" reveal=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --notes) notes="$2"; shift 2 ;;
+            --when) when="$2"; shift 2 ;;
+            --deadline) deadline="$2"; shift 2 ;;
+            --tags) tags="$2"; shift 2 ;;
+            --list) list="$2"; shift 2 ;;
+            --checklist) checklist="$2"; shift 2 ;;
+            --reveal) reveal="true"; shift ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *) title="$1"; shift ;;
+        esac
+    done
+
+    if [ -z "$title" ]; then
+        json_response "false" "Title is required"
+        exit 1
+    fi
+
+    # Build URL (URL scheme for creation to support list placement)
+    local url="things:///add?title=$(urlencode "$title")"
+    [ -n "$notes" ] && url="${url}&notes=$(urlencode "$notes")"
+    [ -n "$when" ] && url="${url}&when=${when}"
+    [ -n "$deadline" ] && url="${url}&deadline=${deadline}"
+    [ -n "$tags" ] && url="${url}&tags=$(urlencode "$tags")"
+    [ -n "$list" ] && url="${url}&list=$(urlencode "$list")"
+    [ -n "$reveal" ] && url="${url}&reveal=true"
+
+    if [ -n "$checklist" ]; then
+        local items=$(echo "$checklist" | tr ',' '\n')
+        url="${url}&checklist-items=$(urlencode "$items")"
+    fi
+
+    open "$url"
+    sleep 0.3
+    json_response "true" "To-do added" "{\"title\": \"$title\"}"
+}
+
+cmd_todo_list() {
+    local list_name="${1:-Today}"
+
+    local script="tell application \"Things3\"
+        set output to \"[\"
+        try
+            set todoList to to dos of list \"$list_name\"
+        on error
+            try
+                set todoList to to dos of project \"$list_name\"
+            on error
+                try
+                    set todoList to to dos of area \"$list_name\"
+                on error
+                    return \"[]\"
+                end try
+            end try
+        end try
+        set todoCount to count of todoList
+        repeat with i from 1 to todoCount
+            set t to item i of todoList
+            set todoId to id of t
+            set todoName to name of t
+            set todoNotes to notes of t
+            set todoStatus to status of t as string
+            set todoTags to tag names of t
+
+            set todoScheduled to \"\"
+            try
+                set schedDate to activation date of t
+                if schedDate is not missing value then
+                    set todoScheduled to (year of schedDate) & \"-\" & (text -2 thru -1 of (\"0\" & ((month of schedDate) as integer))) & \"-\" & (text -2 thru -1 of (\"0\" & (day of schedDate)))
+                end if
+            end try
+
+            set todoDue to \"\"
+            try
+                set dueDate to due date of t
+                if dueDate is not missing value then
+                    set todoDue to (year of dueDate) & \"-\" & (text -2 thru -1 of (\"0\" & ((month of dueDate) as integer))) & \"-\" & (text -2 thru -1 of (\"0\" & (day of dueDate)))
+                end if
+            end try
+
+            -- Escape quotes
+            set AppleScript's text item delimiters to \"\\\"\"
+            set todoName to text items of todoName
+            set AppleScript's text item delimiters to \"\\\\\\\"\"
+            set todoName to todoName as string
+            set AppleScript's text item delimiters to \"\\\"\"
+            set todoNotes to text items of todoNotes
+            set AppleScript's text item delimiters to \"\\\\\\\"\"
+            set todoNotes to todoNotes as string
+            set AppleScript's text item delimiters to \"\"
+
+            -- Escape newlines
+            set AppleScript's text item delimiters to ASCII character 10
+            set todoNotes to text items of todoNotes
+            set AppleScript's text item delimiters to \"\\\\n\"
+            set todoNotes to todoNotes as string
+            set AppleScript's text item delimiters to \"\"
+
+            set output to output & \"{\\\"id\\\": \\\"\" & todoId & \"\\\", \\\"name\\\": \\\"\" & todoName & \"\\\", \\\"notes\\\": \\\"\" & todoNotes & \"\\\", \\\"status\\\": \\\"\" & todoStatus & \"\\\", \\\"tags\\\": \\\"\" & todoTags & \"\\\", \\\"when\\\": \\\"\" & todoScheduled & \"\\\", \\\"deadline\\\": \\\"\" & todoDue & \"\\\"}\"
+            if i < todoCount then
+                set output to output & \", \"
+            end if
+        end repeat
+        set output to output & \"]\"
+        return output
+    end tell"
+
+    local result
+    result=$(osascript -e "$script" 2>&1) || {
+        json_response "false" "AppleScript error: $result"
+        exit 1
+    }
+
+    json_response "true" "Listed to-dos from $list_name" "$result"
+}
+
+cmd_todo_get() {
+    local identifier="$1"
+    if [ -z "$identifier" ]; then
+        json_response "false" "To-do ID or name is required"
+        exit 1
+    fi
+
+    local script="tell application \"Things3\"
+        set t to missing value
+        try
+            set t to to do \"$identifier\"
+        end try
+        if t is missing value then
+            try
+                set t to to do id \"$identifier\"
+            end try
+        end if
+        if t is missing value then
+            set allTodos to to dos
+            repeat with todo in allTodos
+                if name of todo is \"$identifier\" then
+                    set t to todo
+                    exit repeat
+                end if
+            end repeat
+        end if
+        if t is missing value then
+            return \"NOT_FOUND\"
+        end if
+
+        set todoId to id of t
+        set todoName to name of t
+        set todoNotes to notes of t
+        set todoStatus to status of t as string
+        set todoTags to tag names of t
+
+        set todoDue to \"null\"
+        try
+            set d to due date of t
+            if d is not missing value then
+                set todoDue to \"\\\"\" & (year of d) & \"-\" & (text -2 thru -1 of (\"0\" & ((month of d) as integer))) & \"-\" & (text -2 thru -1 of (\"0\" & (day of d))) & \"\\\"\"
+            end if
+        end try
+
+        set todoWhen to \"null\"
+        try
+            set w to activation date of t
+            if w is not missing value then
+                set todoWhen to \"\\\"\" & (year of w) & \"-\" & (text -2 thru -1 of (\"0\" & ((month of w) as integer))) & \"-\" & (text -2 thru -1 of (\"0\" & (day of w))) & \"\\\"\"
+            end if
+        end try
+
+        set todoProject to \"null\"
+        try
+            set p to project of t
+            if p is not missing value then
+                set todoProject to \"\\\"\" & (name of p) & \"\\\"\"
+            end if
+        end try
+
+        -- Escape quotes in name and notes
+        set AppleScript's text item delimiters to \"\\\"\"
+        set todoName to text items of todoName
+        set AppleScript's text item delimiters to \"\\\\\\\"\"
+        set todoName to todoName as string
+        set AppleScript's text item delimiters to \"\\\"\"
+        set todoNotes to text items of todoNotes
+        set AppleScript's text item delimiters to \"\\\\\\\"\"
+        set todoNotes to todoNotes as string
+        set AppleScript's text item delimiters to \"\"
+
+        -- Escape newlines
+        set AppleScript's text item delimiters to ASCII character 10
+        set todoNotes to text items of todoNotes
+        set AppleScript's text item delimiters to \"\\\\n\"
+        set todoNotes to todoNotes as string
+        set AppleScript's text item delimiters to \"\"
+
+        return \"{\\\"id\\\": \\\"\" & todoId & \"\\\", \\\"name\\\": \\\"\" & todoName & \"\\\", \\\"notes\\\": \\\"\" & todoNotes & \"\\\", \\\"status\\\": \\\"\" & todoStatus & \"\\\", \\\"tags\\\": \\\"\" & todoTags & \"\\\", \\\"deadline\\\": \" & todoDue & \", \\\"when\\\": \" & todoWhen & \", \\\"project\\\": \" & todoProject & \"}\"
+    end tell"
+
+    local result
+    result=$(osascript -e "$script" 2>&1) || {
+        json_response "false" "AppleScript error: $result"
+        exit 1
+    }
+
+    if [ "$result" = "NOT_FOUND" ]; then
+        json_response "false" "To-do not found: $identifier"
+        exit 1
+    fi
+
+    json_response "true" "To-do found" "$result"
+}
+
+cmd_todo_update() {
+    local identifier=""
+    local title="" notes="" append_notes="" when="" deadline=""
+    local tags="" add_tags="" list="" completed="" canceled="" reveal=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title) title="$2"; shift 2 ;;
+            --notes) notes="$2"; shift 2 ;;
+            --append-notes) append_notes="$2"; shift 2 ;;
+            --when) when="$2"; shift 2 ;;
+            --deadline) deadline="$2"; shift 2 ;;
+            --tags) tags="$2"; shift 2 ;;
+            --add-tags) add_tags="$2"; shift 2 ;;
+            --list) list="$2"; shift 2 ;;
+            --completed) completed="true"; shift ;;
+            --canceled) canceled="true"; shift ;;
+            --reveal) reveal="true"; shift ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *) identifier="$1"; shift ;;
+        esac
+    done
+
+    if [ -z "$identifier" ]; then
+        json_response "false" "To-do ID or name is required"
+        exit 1
+    fi
+
+    # Get auth token
+    local auth_token=$(get_auth_token)
+    if [ -z "$auth_token" ]; then
+        json_response "false" "Auth token required for updates"
+        exit 1
+    fi
+
+    # Look up ID if needed
+    local task_id=$(lookup_todo_id "$identifier")
+    if [ "$task_id" = "NOT_FOUND" ]; then
+        json_response "false" "To-do not found: $identifier"
+        exit 1
+    fi
+
+    # Build URL
+    local url="things:///update?auth-token=${auth_token}&id=${task_id}"
+    [ -n "$title" ] && url="${url}&title=$(urlencode "$title")"
+    [ -n "$notes" ] && url="${url}&notes=$(urlencode "$notes")"
+    [ -n "$append_notes" ] && url="${url}&append-notes=$(urlencode "$append_notes")"
+    [ -n "$when" ] && url="${url}&when=${when}"
+    [ -n "$deadline" ] && url="${url}&deadline=${deadline}"
+    [ -n "$tags" ] && url="${url}&tags=$(urlencode "$tags")"
+    [ -n "$add_tags" ] && url="${url}&add-tags=$(urlencode "$add_tags")"
+    [ -n "$list" ] && url="${url}&list=$(urlencode "$list")"
+    [ -n "$completed" ] && url="${url}&completed=true"
+    [ -n "$canceled" ] && url="${url}&canceled=true"
+    [ -n "$reveal" ] && url="${url}&reveal=true"
+
+    open "$url"
+    sleep 0.3
+    json_response "true" "To-do updated" "{\"id\": \"$task_id\"}"
+}
+
+cmd_todo_complete() {
+    local identifier="$1"
+    if [ -z "$identifier" ]; then
+        json_response "false" "To-do ID or name is required"
+        exit 1
+    fi
+    cmd_todo_update "$identifier" --completed
+}
+
+# =============================================================================
+# PROJECT COMMANDS
+# =============================================================================
+
+cmd_project_add() {
+    local title=""
+    local notes="" when="" deadline="" tags="" area="" todos="" reveal=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --notes) notes="$2"; shift 2 ;;
+            --when) when="$2"; shift 2 ;;
+            --deadline) deadline="$2"; shift 2 ;;
+            --tags) tags="$2"; shift 2 ;;
+            --area) area="$2"; shift 2 ;;
+            --todos) todos="$2"; shift 2 ;;
+            --reveal) reveal="true"; shift ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *) title="$1"; shift ;;
+        esac
+    done
+
+    if [ -z "$title" ]; then
+        json_response "false" "Title is required"
+        exit 1
+    fi
+
+    local url="things:///add-project?title=$(urlencode "$title")"
+    [ -n "$notes" ] && url="${url}&notes=$(urlencode "$notes")"
+    [ -n "$when" ] && url="${url}&when=${when}"
+    [ -n "$deadline" ] && url="${url}&deadline=${deadline}"
+    [ -n "$tags" ] && url="${url}&tags=$(urlencode "$tags")"
+    [ -n "$area" ] && url="${url}&area=$(urlencode "$area")"
+    [ -n "$reveal" ] && url="${url}&reveal=true"
+
+    if [ -n "$todos" ]; then
+        local items=$(echo "$todos" | tr ',' '\n')
+        url="${url}&to-dos=$(urlencode "$items")"
+    fi
+
+    open "$url"
+    sleep 0.3
+    json_response "true" "Project added" "{\"title\": \"$title\"}"
+}
+
+cmd_project_update() {
+    local identifier=""
+    local title="" notes="" when="" deadline="" tags="" area="" completed="" canceled=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title) title="$2"; shift 2 ;;
+            --notes) notes="$2"; shift 2 ;;
+            --when) when="$2"; shift 2 ;;
+            --deadline) deadline="$2"; shift 2 ;;
+            --tags) tags="$2"; shift 2 ;;
+            --area) area="$2"; shift 2 ;;
+            --completed) completed="true"; shift ;;
+            --canceled) canceled="true"; shift ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *) identifier="$1"; shift ;;
+        esac
+    done
+
+    if [ -z "$identifier" ]; then
+        json_response "false" "Project ID or name is required"
+        exit 1
+    fi
+
+    local auth_token=$(get_auth_token)
+    if [ -z "$auth_token" ]; then
+        json_response "false" "Auth token required for updates"
+        exit 1
+    fi
+
+    # Look up project ID
+    local project_id
+    if [[ "$identifier" =~ ^[A-Za-z0-9_-]{20,}$ ]]; then
+        project_id="$identifier"
+    else
+        project_id=$(osascript -e "tell application \"Things3\" to return id of project \"$identifier\"" 2>/dev/null) || {
+            json_response "false" "Project not found: $identifier"
+            exit 1
+        }
+    fi
+
+    local url="things:///update-project?auth-token=${auth_token}&id=${project_id}"
+    [ -n "$title" ] && url="${url}&title=$(urlencode "$title")"
+    [ -n "$notes" ] && url="${url}&notes=$(urlencode "$notes")"
+    [ -n "$when" ] && url="${url}&when=${when}"
+    [ -n "$deadline" ] && url="${url}&deadline=${deadline}"
+    [ -n "$tags" ] && url="${url}&tags=$(urlencode "$tags")"
+    [ -n "$area" ] && url="${url}&area=$(urlencode "$area")"
+    [ -n "$completed" ] && url="${url}&completed=true"
+    [ -n "$canceled" ] && url="${url}&canceled=true"
+
+    open "$url"
+    sleep 0.3
+    json_response "true" "Project updated" "{\"id\": \"$project_id\"}"
+}
+
+# =============================================================================
+# NAVIGATION COMMANDS
+# =============================================================================
+
+cmd_show() {
+    local identifier="${1:-today}"
+    local filter=""
+
+    shift 2>/dev/null || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --filter) filter="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local builtin_lists="inbox today anytime upcoming someday logbook tomorrow deadlines repeating all-projects logged-projects"
+    local identifier_lower=$(echo "$identifier" | tr '[:upper:]' '[:lower:]')
+    local is_builtin=false
+
+    for list in $builtin_lists; do
+        if [ "$identifier_lower" = "$list" ]; then
+            is_builtin=true
+            break
+        fi
+    done
+
+    local url
+    if [ "$is_builtin" = true ]; then
+        url="things:///show?id=${identifier_lower}"
+    elif [[ "$identifier" =~ ^[A-Za-z0-9_-]{20,}$ ]]; then
+        url="things:///show?id=${identifier}"
+    else
+        url="things:///show?query=$(urlencode "$identifier")"
+    fi
+
+    [ -n "$filter" ] && url="${url}&filter=$(urlencode "$filter")"
+
+    open "$url"
+    sleep 0.3
+    json_response "true" "Showing: $identifier"
+}
+
+cmd_search() {
+    local query="${1:-}"
+
+    if [ -n "$query" ]; then
+        open "things:///search?query=$(urlencode "$query")"
+    else
+        open "things:///search"
+    fi
+    sleep 0.3
+    json_response "true" "Opened search${query:+ for: $query}"
+}
+
+# =============================================================================
+# INIT COMMAND
+# =============================================================================
+
+cmd_init() {
+    local tasks_file=""
+    local things_project=""
+    local populate=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --populate) populate=true; shift ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *)
+                if [ -z "$tasks_file" ]; then
+                    tasks_file="$1"
+                else
+                    things_project="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$tasks_file" ] || [ -z "$things_project" ]; then
+        json_response "false" "Usage: things init <tasks.md> <Things-project> [--populate]"
+        exit 1
+    fi
+
+    if [ -f "$tasks_file" ]; then
+        json_response "false" "File already exists: $tasks_file"
+        exit 1
+    fi
+
+    # Get project name for header
+    local project_name=$(basename "$(dirname "$tasks_file")")
+    [ "$project_name" = "." ] && project_name=$(basename "$things_project")
+
+    # Capitalize first letter (bash 3 compatible)
+    local first_char=$(echo "${project_name:0:1}" | tr '[:lower:]' '[:upper:]')
+    local rest="${project_name:1}"
+    project_name="${first_char}${rest}"
+
+    # Create directory if needed
+    mkdir -p "$(dirname "$tasks_file")"
+
+    # Generate tasks.md content
+    local content="# Tasks - ${project_name}
+
+**Synkad med:** Things 3 → $things_project
+**Senast synkad:** $(date +%Y-%m-%d)
+
+---
+
+## Väntar på externa
+
+---
+
+## Att göra
+
+---
+
+## Utveckling
+
+---
+
+## Klart
+
+"
+
+    echo "$content" > "$tasks_file"
+
+    # Populate with existing todos if requested
+    if [ "$populate" = true ]; then
+        echo "Populating from Things..."
+        cmd_sync "$tasks_file" "$things_project"
+    else
+        json_response "true" "Created $tasks_file linked to $things_project"
+    fi
+}
+
+# =============================================================================
+# SYNC COMMAND
+# =============================================================================
+
+cmd_sync() {
+    local tasks_file=""
+    local things_project=""
+    local dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) dry_run=true; shift ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *)
+                if [ -z "$tasks_file" ]; then
+                    tasks_file="$1"
+                else
+                    things_project="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$tasks_file" ] || [ -z "$things_project" ]; then
+        json_response "false" "Usage: things sync <tasks.md> <Things-project> [--dry-run]"
+        exit 1
+    fi
+
+    if [ ! -f "$tasks_file" ]; then
+        json_response "false" "File not found: $tasks_file"
+        exit 1
+    fi
+
+    # Get todos from Things
+    local things_result
+    things_result=$(cmd_todo_list "$things_project" 2>/dev/null) || {
+        json_response "false" "Could not read Things project: $things_project"
+        exit 1
+    }
+
+    # Use Python for robust sync logic
+    local dry_run_py="False"
+    [ "$dry_run" = true ] && dry_run_py="True"
+
+    python3 - "$things_result" "$tasks_file" "$dry_run_py" << 'PYTHON_SYNC'
+import json
+import re
+import sys
+from pathlib import Path
+from datetime import date
+
+things_result = sys.argv[1]
+tasks_file_path = sys.argv[2]
+dry_run = sys.argv[3] == "True"
+
+# Load Things data
+things_data = json.loads(things_result).get('data', [])
+
+# Build Things lookup by ID and by normalized title
+things_by_id = {t['id']: t for t in things_data}
+things_by_title = {}
+for t in things_data:
+    normalized = t['name'].strip().lower()
+    things_by_title[normalized] = t
+
+# Read tasks.md
+tasks_file = Path(tasks_file_path)
+content = tasks_file.read_text()
+lines = content.split('\n')
+
+# Parse tasks.md
+task_pattern = re.compile(r'^- \[([ x~])\] (.+)$')
+things_id_pattern = re.compile(r'^\s+- things:([A-Za-z0-9_-]+)\s*$')
+note_pattern = re.compile(r'^\s+- (.+)$')
+tag_pattern = re.compile(r'`([^`]+)`')
+
+md_tasks = []
+i = 0
+
+while i < len(lines):
+    line = lines[i]
+    match = task_pattern.match(line)
+    if match:
+        status_char = match.group(1)
+        rest = match.group(2)
+
+        tags = tag_pattern.findall(rest)
+        title = tag_pattern.sub('', rest).strip()
+
+        status = 'open' if status_char == ' ' else ('completed' if status_char == 'x' else 'in_progress')
+
+        task = {
+            'line_num': i,
+            'status': status,
+            'title': title,
+            'tags': tags,
+            'things_id': None,
+            'notes_lines': []
+        }
+
+        j = i + 1
+        while j < len(lines):
+            subline = lines[j]
+            if not subline.startswith('  '):
+                break
+
+            id_match = things_id_pattern.match(subline)
+            if id_match:
+                task['things_id'] = id_match.group(1)
+            elif note_pattern.match(subline):
+                task['notes_lines'].append(j)
+            j += 1
+
+        md_tasks.append(task)
+        i = j
+    else:
+        i += 1
+
+# Sync logic
+actions = []
+ids_linked = 0
+status_synced = 0
+new_in_things = 0
+
+matched_things_ids = set()
+
+for task in md_tasks:
+    things_todo = None
+
+    if task['things_id']:
+        things_todo = things_by_id.get(task['things_id'])
+        if things_todo:
+            matched_things_ids.add(task['things_id'])
+    else:
+        normalized_title = task['title'].strip().lower()
+        things_todo = things_by_title.get(normalized_title)
+
+        if things_todo:
+            task['things_id'] = things_todo['id']
+            matched_things_ids.add(things_todo['id'])
+            actions.append(f"LINK: {task['title']} -> {things_todo['id']}")
+            ids_linked += 1
+
+    if things_todo:
+        things_status = things_todo.get('status', 'open')
+        md_status = task['status']
+
+        if things_status == 'completed' and md_status != 'completed':
+            actions.append(f"STATUS: {task['title']} -> completed (from Things)")
+            task['new_status'] = 'completed'
+            status_synced += 1
+
+new_todos_for_md = []
+for tid, todo in things_by_id.items():
+    if tid not in matched_things_ids and todo.get('status') == 'open':
+        new_todos_for_md.append(todo)
+        actions.append(f"ADD TO MD: {todo['name']} ({tid})")
+        new_in_things += 1
+
+if not dry_run:
+    new_lines = lines.copy()
+
+    for task in md_tasks:
+        if task.get('new_status') == 'completed':
+            old_line = new_lines[task['line_num']]
+            new_line = old_line.replace('- [ ]', '- [x]').replace('- [~]', '- [x]')
+            if 'done:' not in new_line:
+                new_line = new_line.rstrip() + f" `done:{date.today().strftime('%Y-%m')}`"
+            new_lines[task['line_num']] = new_line
+
+    insertions = []
+    for task in md_tasks:
+        if task['things_id']:
+            has_id_line = False
+            for ln in task.get('notes_lines', []):
+                if things_id_pattern.match(lines[ln]):
+                    has_id_line = True
+                    break
+
+            if not has_id_line:
+                original_line = lines[task['line_num']]
+                search_start = content.find(original_line)
+                search_end = min(search_start + 500, len(content))
+                if f"things:{task['things_id']}" not in content[search_start:search_end]:
+                    insert_at = task['line_num'] + 1
+                    insertions.append((insert_at, f"  - things:{task['things_id']}"))
+
+    insertions.sort(key=lambda x: x[0], reverse=True)
+    for line_num, text in insertions:
+        new_lines.insert(line_num, text)
+
+    if new_todos_for_md:
+        # Find "## Att göra" section or insert before "## Klart"
+        insert_idx = len(new_lines)
+        att_gora_idx = None
+        for idx, line in enumerate(new_lines):
+            if line.strip().lower() in ['## att göra', '## att gora']:
+                att_gora_idx = idx
+            elif line.strip().lower() == '## klart':
+                insert_idx = idx
+                break
+            elif att_gora_idx and line.startswith('---'):
+                # End of "Att göra" section
+                insert_idx = idx
+                break
+
+        new_section = []
+        for todo in new_todos_for_md:
+            tags_str = ' '.join(f'`{t.strip()}`' for t in todo.get('tags', '').split(',') if t.strip())
+            new_section.append(f"- [ ] {todo['name']}{' ' + tags_str if tags_str else ''}")
+            new_section.append(f"  - things:{todo['id']}")
+            if todo.get('notes'):
+                for note_line in todo['notes'].split('\\n'):
+                    if note_line.strip():
+                        new_section.append(f"  - {note_line.strip()}")
+            new_section.append("")
+
+        if new_section:
+            new_lines = new_lines[:insert_idx] + [''] + new_section + new_lines[insert_idx:]
+
+    tasks_file.write_text('\n'.join(new_lines))
+
+print("=== SYNC REPORT ===")
+for action in actions:
+    print(action)
+print()
+print(f"IDs linked: {ids_linked}")
+print(f"Status synced: {status_synced}")
+print(f"New in Things (added to MD): {new_in_things}")
+
+result = {
+    "ids_linked": ids_linked,
+    "status_synced": status_synced,
+    "new_in_things": new_in_things,
+    "dry_run": dry_run
+}
+print()
+print(json.dumps({"success": True, "message": "Sync complete", "data": result}))
+PYTHON_SYNC
+}
+
+# =============================================================================
+# USAGE
+# =============================================================================
+
+usage() {
+    cat <<EOF
+Things 3 CLI - Unified interface for Things 3 on macOS
+
+Usage: things <command> [options]
+
+Commands:
+  todo add <title> [--notes --when --deadline --tags --list --checklist --reveal]
+  todo list [list/project/area]
+  todo get <id-or-name>
+  todo update <id-or-name> [--title --notes --when --deadline --tags --list --completed --canceled]
+  todo complete <id-or-name>
+
+  project add <title> [--notes --when --deadline --tags --area --todos --reveal]
+  project update <id-or-name> [--title --notes --when --deadline --completed --canceled]
+
+  show [inbox|today|anytime|upcoming|someday|logbook|project-name] [--filter tags]
+  search [query]
+
+  init <tasks.md> <Things-project> [--populate]  Initialize a tasks.md file
+  sync <tasks.md> <Things-project> [--dry-run]   Sync tasks.md with Things
+
+Date formats for --when and --deadline:
+  today, tomorrow, evening, anytime, someday, or YYYY-MM-DD
+
+tasks.md structure:
+  # Tasks - Project Name
+  **Synkad med:** Things 3 → Things Project Name
+  **Senast synkad:** YYYY-MM-DD
+
+  ## Väntar på externa
+  - [ ] Task title \`tag1\` \`waiting\`
+    - things:THINGS_ID
+    - Notes here
+
+  ## Att göra
+  - [ ] Task title \`tag1\`
+    - things:THINGS_ID
+
+  ## Klart
+  - [x] Completed task \`done:YYYY-MM\`
+    - things:THINGS_ID
+
+Examples:
+  things todo add "Buy milk" --when today --list "Shopping"
+  things todo list "Bellman: Fakturakontroll"
+  things init ./project/tasks.md "My Project" --populate
+  things sync ./tasks.md "My Project" --dry-run
+EOF
+    exit 0
+}
+
+usage_todo() {
+    cat <<EOF
+Usage: things todo <command> [options]
+
+Commands:
+  add <title>      Create a new to-do
+  list [name]      List to-dos from a list/project/area (default: Today)
+  get <id|name>    Get details of a to-do
+  update <id|name> Update a to-do
+  complete <id|name> Mark a to-do as complete
+
+Options for 'add':
+  --notes "text"   Add notes
+  --when DATE      Schedule date (today, tomorrow, YYYY-MM-DD)
+  --deadline DATE  Due date
+  --tags "a,b"     Add tags
+  --list "name"    Add to list/project/area
+  --checklist "a,b" Add checklist items
+  --reveal         Show in Things after creation
+
+Options for 'update':
+  --title "new"    Change title
+  --notes "text"   Replace notes
+  --append-notes   Append to notes
+  --when DATE      Schedule date
+  --deadline DATE  Due date
+  --tags "a,b"     Replace tags
+  --add-tags "a,b" Add tags
+  --list "name"    Move to list/project
+  --completed      Mark as complete
+  --canceled       Mark as canceled
+EOF
+    exit 0
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+case "${1:-}" in
+    todo)
+        shift
+        case "${1:-}" in
+            add) shift; cmd_todo_add "$@" ;;
+            list) shift; cmd_todo_list "$@" ;;
+            get) shift; cmd_todo_get "$@" ;;
+            update) shift; cmd_todo_update "$@" ;;
+            complete) shift; cmd_todo_complete "$@" ;;
+            -h|--help|"") usage_todo ;;
+            *) echo "Unknown todo command: $1" >&2; usage_todo ;;
+        esac
+        ;;
+    project)
+        shift
+        case "${1:-}" in
+            add) shift; cmd_project_add "$@" ;;
+            update) shift; cmd_project_update "$@" ;;
+            *) echo "Unknown project command: ${1:-}" >&2; exit 1 ;;
+        esac
+        ;;
+    show) shift; cmd_show "$@" ;;
+    search) shift; cmd_search "$@" ;;
+    init) shift; cmd_init "$@" ;;
+    sync) shift; cmd_sync "$@" ;;
+    -h|--help|"") usage ;;
+    *) echo "Unknown command: $1" >&2; usage ;;
+esac

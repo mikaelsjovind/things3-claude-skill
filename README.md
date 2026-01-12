@@ -1,13 +1,13 @@
-# Things 3 Skill for Claude Code
+# Things 3 CLI for Claude Code
 
-A Claude Code skill for managing Things 3 tasks on macOS using the [Things URL Scheme](https://culturedcode.com/things/support/articles/2803573/).
+A unified command-line interface for Things 3 on macOS, with bidirectional sync to markdown task files.
 
 ## Features
 
-- Create and update tasks and projects via URL Scheme
-- Read task data via AppleScript
-- Schedule, complete, and organize tasks
-- All operations return JSON for easy parsing
+- **Unified CLI**: Single `things` command with subcommands
+- **Bidirectional sync**: Sync tasks between Things 3 and `tasks.md` files
+- **ID-based linking**: Tasks are linked by Things ID for reliable sync
+- **JSON output**: All commands return JSON for easy parsing
 
 ## Prerequisites
 
@@ -16,117 +16,138 @@ A Claude Code skill for managing Things 3 tasks on macOS using the [Things URL S
 
 ## Installation
 
-1. Clone this repository:
-```bash
-git clone https://github.com/mikaelsjovind/things3-claude-skill.git
-```
-
-2. Copy to your Claude skills directory:
+1. Copy to your Claude skills directory:
 ```bash
 mkdir -p ~/.claude/skills
-cp -r things3-claude-skill ~/.claude/skills/things3
+cp -r things3 ~/.claude/skills/
 ```
 
-3. Make scripts executable:
+2. Make the CLI executable:
 ```bash
-chmod +x ~/.claude/skills/things3/scripts/*.sh
+chmod +x ~/.claude/skills/things3/things
 ```
 
-4. **Set up auth token** (required for update operations):
+3. **Set up auth token** (required for update operations):
    - Open Things 3 → Settings → General
    - Enable "Things URLs" and click "Manage"
    - Copy your token to `~/.claude/skills/things3/auth-token`
 
 ## Usage
 
-Use natural language with Claude Code:
+### With Claude Code
+
+Use natural language:
 
 - "Add a task to Things to review the report"
-- "Create a project called Website Redesign with tasks"
 - "Show me my tasks for today"
 - "Complete the presentation task"
-- "Schedule the meeting for next Monday"
+- "Sync my tasks with Things"
+- "Initialize tasks.md for my project"
 
-## Available Scripts
+### Direct CLI Usage
 
-### Creating Items (no auth required)
+```bash
+# Add a task
+things todo add "Review report" --when today --list "My Project"
 
-| Script | Description |
-|--------|-------------|
-| `add-todo.sh` | Add a new to-do |
-| `add-project.sh` | Add a new project |
+# List tasks
+things todo list "Bellman: Fakturakontroll"
 
-### Updating Items (auth required)
+# Complete a task
+things todo complete "Review report"
 
-| Script | Description |
-|--------|-------------|
-| `update-todo.sh` | Update an existing to-do |
-| `update-project.sh` | Update an existing project |
-| `complete-todo.sh` | Mark a to-do as complete |
-| `schedule-todo.sh` | Schedule a to-do for a date |
+# Initialize a tasks.md
+things init ./project/tasks.md "My Project" --populate
 
-### Reading Data (AppleScript)
+# Sync tasks.md with Things
+things sync ./tasks.md "My Project"
+```
 
-| Script | Description |
-|--------|-------------|
-| `list-todos.sh` | List to-dos from a list/project |
-| `list-today-by-area.sh` | List today's tasks by area |
-| `get-todo.sh` | Get details of a to-do |
+## Commands
+
+### Todo Commands
+
+| Command | Description |
+|---------|-------------|
+| `things todo add "title"` | Add a new to-do |
+| `things todo list [name]` | List to-dos from list/project/area |
+| `things todo get "name"` | Get details of a to-do |
+| `things todo update "name"` | Update a to-do (auth required) |
+| `things todo complete "name"` | Mark as complete (auth required) |
+
+### Project Commands
+
+| Command | Description |
+|---------|-------------|
+| `things project add "title"` | Add a new project |
+| `things project update "name"` | Update a project (auth required) |
 
 ### Navigation
 
-| Script | Description |
-|--------|-------------|
-| `show.sh` | Navigate to item or list |
-| `search.sh` | Open search in Things |
+| Command | Description |
+|---------|-------------|
+| `things show [list]` | Navigate to item or list in Things |
+| `things search [query]` | Open search in Things |
 
-## Examples
+### Sync Commands
 
-### Add a task to Today
-```bash
-./scripts/add-todo.sh "Review report" "notes:Check figures" "when:today"
+| Command | Description |
+|---------|-------------|
+| `things init <file> <project>` | Initialize a tasks.md linked to Things |
+| `things sync <file> <project>` | Bidirectional sync with Things |
+
+## tasks.md Format
+
+The sync feature uses markdown files with this structure:
+
+```markdown
+# Tasks - Project Name
+
+**Synkad med:** Things 3 → Things Project Name
+**Senast synkad:** 2026-01-12
+
+---
+
+## Väntar på externa
+
+- [ ] Task waiting on external `waiting` `tag1`
+  - things:THINGS_ID
+  - Notes about this task
+
+---
+
+## Att göra
+
+- [ ] Task to do `tag1`
+  - things:THINGS_ID
+
+---
+
+## Klart
+
+- [x] Completed task `done:2026-01`
+  - things:THINGS_ID
 ```
 
-### Create a project with tasks
-```bash
-./scripts/add-project.sh "Website Redesign" "todos:Design,Build,Test"
-```
+### Sync Behavior
 
-### Schedule and complete
-```bash
-./scripts/schedule-todo.sh "Presentation" "2026-01-10"
-./scripts/complete-todo.sh "Presentation"
-```
-
-### Move task to project
-```bash
-./scripts/update-todo.sh "My Task" "list:Website Redesign"
-```
+- **First sync**: Tasks matched by title, IDs added automatically
+- **Subsequent syncs**: Tasks matched by `things:ID`
+- **Things → MD**: New tasks added, completed tasks marked `[x]`
+- **MD → Things**: (Future) New tasks without ID created in Things
 
 ## Date Formats
 
-The `when` and `deadline` parameters accept:
+For `--when` and `--deadline`:
 - Keywords: `today`, `tomorrow`, `evening`, `anytime`, `someday`
 - ISO date: `YYYY-MM-DD`
 - Date-time: `YYYY-MM-DD@HH:MM`
 
-## Response Format
-
-All scripts return JSON:
-```json
-{"success": true, "message": "To-do added", "data": {"title": "My Task"}}
-{"success": false, "message": "Auth token required", "data": null}
-```
-
 ## Resources
 
-- [Things URL Scheme Documentation](https://culturedcode.com/things/support/articles/2803573/)
+- [Things URL Scheme](https://culturedcode.com/things/support/articles/2803573/)
 - [Things AppleScript Guide](https://culturedcode.com/things/support/articles/2803572/)
-
-### Reference Files
-- `references/url-scheme-reference.md` - Complete URL Scheme API documentation
-- `references/applescript-api.md` - AppleScript API for reading data
 
 ## License
 
-MIT License - see LICENSE file for details
+MIT License
