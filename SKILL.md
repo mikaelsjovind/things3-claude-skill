@@ -77,7 +77,30 @@ things sync <tasks.md> <Things-project> [--dry-run]
 
 ## tasks.md Structure
 
-The sync feature uses a markdown file to track todos linked to a Things project:
+The sync feature uses a markdown file to track todos linked to a Things project.
+
+### Sections and Things Mapping
+
+| Sektion | Beskrivning | Things when | Things tag |
+|---------|-------------|-------------|------------|
+| **Att göra** | Mina uppgifter (Mikael) | anytime | (ingen) |
+| **Väntar på externa** | Uppgifter för externa parter | someday | `väntar` |
+| **Blockerad** | Uppgifter blockerade av annat | someday | `blockerad` |
+| **Idéer** | Framtida idéer | someday | `idé` |
+| **Klart** | Avslutade uppgifter | - | - |
+
+### Title Format
+
+- **Mina uppgifter (Att göra)**: Aktiv verbform utan @person
+  - `Skapa rapport för Q2 försäljning`
+  - `Förbered presentation för kundmöte`
+
+- **Externa uppgifter**: Aktiv verbform + @Person
+  - `Skicka resurslista till Mikael @Patrik`
+  - `Synka med Robin och Nina @Mathias`
+  - `Återkoppla om Azure-miljö @Nordlo`
+
+### Template
 
 ```markdown
 # Tasks - Project Name
@@ -87,25 +110,43 @@ The sync feature uses a markdown file to track todos linked to a Things project:
 
 ---
 
-## Väntar på externa
+## Att göra
 
-- [ ] Task waiting on external `tag1` `waiting`
+- [ ] Skapa rapport för Q2 försäljning
   - things:THINGS_ID
-  - Notes about this task
+  - Anteckningar om uppgiften
 
 ---
 
-## Att göra
+## Väntar på externa
 
-- [ ] Task to do `tag1`
+- [ ] Skicka resurslista till Mikael @Patrik
   - things:THINGS_ID
-  - More notes
+  - Anteckningar
+
+- [ ] Återkoppla om Azure-miljö @Nordlo
+  - things:THINGS_ID
+
+---
+
+## Blockerad
+
+- [ ] Ta fram prisförslag @Mikael
+  - things:THINGS_ID
+  - Blockerad av: Kartläggning måste slutföras först
+
+---
+
+## Idéer
+
+- [ ] Ta fram koncept på QR-kod
+  - things:THINGS_ID
 
 ---
 
 ## Klart
 
-- [x] Completed task `done:YYYY-MM`
+- [x] Slutför budgetplanering `done:2024-07`
   - things:THINGS_ID
 ```
 
@@ -115,6 +156,7 @@ The sync feature uses a markdown file to track todos linked to a Things project:
 - **Title matching**: Tasks without IDs are matched by title on first sync
 - **Status sync**: Completed tasks in Things are marked `[x]` in markdown
 - **New tasks**: Tasks in Things not in markdown are added automatically
+- **Section mapping**: Section determines `when` and `tag` in Things
 
 ## Date Formats
 

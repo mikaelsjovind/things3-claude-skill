@@ -584,17 +584,19 @@ cmd_init() {
 }
 
 # =============================================================================
-# SYNC COMMAND
+# SYNC COMMAND (Bidirectional)
 # =============================================================================
 
 cmd_sync() {
     local tasks_file=""
     local things_project=""
     local dry_run=false
+    local auto_yes=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
+            -y|--yes) auto_yes=true; shift ;;
             -*) echo "Unknown option: $1" >&2; exit 1 ;;
             *)
                 if [ -z "$tasks_file" ]; then
@@ -608,7 +610,7 @@ cmd_sync() {
     done
 
     if [ -z "$tasks_file" ] || [ -z "$things_project" ]; then
-        json_response "false" "Usage: things sync <tasks.md> <Things-project> [--dry-run]"
+        json_response "false" "Usage: things sync <tasks.md> <Things-project> [--dry-run] [-y]"
         exit 1
     fi
 
@@ -617,6 +619,9 @@ cmd_sync() {
         exit 1
     fi
 
+    # Get auth token for updates
+    local auth_token=$(get_auth_token)
+
     # Get todos from Things
     local things_result
     things_result=$(cmd_todo_list "$things_project" 2>/dev/null) || {
@@ -624,11 +629,15 @@ cmd_sync() {
         exit 1
     }
 
-    # Use Python for robust sync logic
+    # Use Python for robust bidirectional sync logic
     local dry_run_py="False"
     [ "$dry_run" = true ] && dry_run_py="True"
+    local auto_yes_py="False"
+    [ "$auto_yes" = true ] && auto_yes_py="True"
 
-    python3 - "$things_result" "$tasks_file" "$dry_run_py" << 'PYTHON_SYNC'
+    # Run sync and capture update commands
+    local sync_output
+    sync_output=$(python3 - "$things_result" "$tasks_file" "$dry_run_py" "$auto_yes_py" << 'PYTHON_SYNC'
 import json
 import re
 import sys
@@ -638,11 +647,12 @@ from datetime import date
 things_result = sys.argv[1]
 tasks_file_path = sys.argv[2]
 dry_run = sys.argv[3] == "True"
+auto_yes = sys.argv[4] == "True"
 
 # Load Things data
 things_data = json.loads(things_result).get('data', [])
 
-# Build Things lookup by ID and by normalized title
+# Build Things lookup by ID
 things_by_id = {t['id']: t for t in things_data}
 things_by_title = {}
 for t in things_data:
@@ -654,23 +664,80 @@ tasks_file = Path(tasks_file_path)
 content = tasks_file.read_text()
 lines = content.split('\n')
 
-# Parse tasks.md
+# Parse tasks.md with full field extraction
 task_pattern = re.compile(r'^- \[([ x~])\] (.+)$')
 things_id_pattern = re.compile(r'^\s+- things:([A-Za-z0-9_-]+)\s*$')
 note_pattern = re.compile(r'^\s+- (.+)$')
 tag_pattern = re.compile(r'`([^`]+)`')
+deadline_pattern = re.compile(r'`deadline:(\d{4}-\d{2}-\d{2})`')
+when_pattern = re.compile(r'`when:([^`]+)`')
+
+def extract_md_notes(lines, start_idx, end_idx):
+    """Extract notes from MD task, excluding things:ID line"""
+    notes = []
+    for i in range(start_idx, end_idx):
+        line = lines[i]
+        if line.startswith('  ') and not things_id_pattern.match(line):
+            # Remove leading "  - " and add to notes
+            note_text = re.sub(r'^\s+- ', '', line)
+            if note_text.strip():
+                notes.append(note_text.strip())
+    return '\n'.join(notes)
+
+def normalize_notes(notes):
+    """Normalize notes for comparison"""
+    if not notes:
+        return ''
+    # Remove extra whitespace, normalize newlines
+    lines = [l.strip() for l in notes.split('\n') if l.strip()]
+    return '\n'.join(lines)
+
+# Section to Things mapping based on SKILL.md
+SECTION_DEFAULTS = {
+    'att göra': {'when': 'anytime', 'tag': None},
+    'väntar på externa': {'when': 'someday', 'tag': 'väntar'},
+    'blockerad': {'when': 'someday', 'tag': 'blockerad'},
+    'idéer': {'when': 'someday', 'tag': 'idé'},
+    'klart': {'when': None, 'tag': None},
+}
+
+def get_section_defaults(section_name):
+    """Get Things defaults for a section"""
+    if not section_name:
+        return {'when': 'anytime', 'tag': None}
+    normalized = section_name.strip().lower()
+    for key, defaults in SECTION_DEFAULTS.items():
+        if key in normalized:
+            return defaults
+    return {'when': 'anytime', 'tag': None}
 
 md_tasks = []
 i = 0
+current_section = None
 
 while i < len(lines):
     line = lines[i]
+
+    # Track current section
+    if line.startswith('## '):
+        current_section = line[3:].strip()
+
     match = task_pattern.match(line)
     if match:
         status_char = match.group(1)
         rest = match.group(2)
 
-        tags = tag_pattern.findall(rest)
+        # Extract tags (excluding special tags)
+        all_tags = tag_pattern.findall(rest)
+        regular_tags = [t for t in all_tags if not t.startswith(('done:', 'deadline:', 'when:'))]
+
+        # Extract deadline and when
+        deadline_match = deadline_pattern.search(rest)
+        when_match = when_pattern.search(rest)
+        deadline = deadline_match.group(1) if deadline_match else ''
+        when = when_match.group(1) if when_match else ''
+
+        # Clean title
         title = tag_pattern.sub('', rest).strip()
 
         status = 'open' if status_char == ' ' else ('completed' if status_char == 'x' else 'in_progress')
@@ -679,12 +746,17 @@ while i < len(lines):
             'line_num': i,
             'status': status,
             'title': title,
-            'tags': tags,
+            'tags': regular_tags,
+            'deadline': deadline,
+            'when': when,
             'things_id': None,
-            'notes_lines': []
+            'notes_start': None,
+            'notes_end': None,
+            'section': current_section,
         }
 
         j = i + 1
+        task['notes_start'] = j
         while j < len(lines):
             subline = lines[j]
             if not subline.startswith('  '):
@@ -693,26 +765,29 @@ while i < len(lines):
             id_match = things_id_pattern.match(subline)
             if id_match:
                 task['things_id'] = id_match.group(1)
-            elif note_pattern.match(subline):
-                task['notes_lines'].append(j)
             j += 1
+        task['notes_end'] = j
+
+        # Extract notes text
+        task['notes'] = extract_md_notes(lines, task['notes_start'], task['notes_end'])
 
         md_tasks.append(task)
         i = j
     else:
         i += 1
 
-# Sync logic
-actions = []
-ids_linked = 0
-status_synced = 0
-new_in_things = 0
+# Bidirectional sync logic
+diffs = []
+things_updates = []  # Commands to update Things
+md_updates = []  # Updates to apply to MD
+new_in_md = []  # New tasks to add to MD
 
 matched_things_ids = set()
 
 for task in md_tasks:
     things_todo = None
 
+    # Match by ID first, then by title
     if task['things_id']:
         things_todo = things_by_id.get(task['things_id'])
         if things_todo:
@@ -720,109 +795,511 @@ for task in md_tasks:
     else:
         normalized_title = task['title'].strip().lower()
         things_todo = things_by_title.get(normalized_title)
-
         if things_todo:
             task['things_id'] = things_todo['id']
             matched_things_ids.add(things_todo['id'])
-            actions.append(f"LINK: {task['title']} -> {things_todo['id']}")
-            ids_linked += 1
+            diffs.append({
+                'task': task['title'],
+                'field': 'id',
+                'action': 'LINK',
+                'detail': f"Linked to {things_todo['id']}"
+            })
 
     if things_todo:
+        task_diffs = []
+
+        # Compare status
         things_status = things_todo.get('status', 'open')
         md_status = task['status']
+        if things_status != md_status:
+            if things_status == 'completed' and md_status != 'completed':
+                task_diffs.append({
+                    'field': 'status',
+                    'md': md_status,
+                    'things': things_status,
+                    'action': 'MD ← Things',
+                    'detail': 'Mark completed in MD'
+                })
+                md_updates.append({'task': task, 'field': 'status', 'value': 'completed'})
+            elif md_status == 'completed' and things_status != 'completed':
+                task_diffs.append({
+                    'field': 'status',
+                    'md': md_status,
+                    'things': things_status,
+                    'action': 'MD → Things',
+                    'detail': 'Mark completed in Things'
+                })
+                things_updates.append({'id': task['things_id'], 'field': 'completed', 'value': 'true'})
 
-        if things_status == 'completed' and md_status != 'completed':
-            actions.append(f"STATUS: {task['title']} -> completed (from Things)")
-            task['new_status'] = 'completed'
-            status_synced += 1
+        # Compare notes
+        md_notes = normalize_notes(task.get('notes', ''))
+        things_notes = normalize_notes(things_todo.get('notes', '').replace('\\n', '\n'))
 
-new_todos_for_md = []
+        if md_notes != things_notes:
+            # Determine which is newer/longer (simple heuristic: longer = more info)
+            if len(md_notes) > len(things_notes):
+                task_diffs.append({
+                    'field': 'notes',
+                    'md_len': len(md_notes),
+                    'things_len': len(things_notes),
+                    'action': 'MD → Things',
+                    'detail': f'MD has more content ({len(md_notes)} vs {len(things_notes)} chars)'
+                })
+                things_updates.append({'id': task['things_id'], 'field': 'notes', 'value': md_notes})
+            elif len(things_notes) > len(md_notes):
+                task_diffs.append({
+                    'field': 'notes',
+                    'md_len': len(md_notes),
+                    'things_len': len(things_notes),
+                    'action': 'MD ← Things',
+                    'detail': f'Things has more content ({len(things_notes)} vs {len(md_notes)} chars)'
+                })
+                md_updates.append({'task': task, 'field': 'notes', 'value': things_notes})
+
+        # Compare tags
+        md_tags = set(task.get('tags', []))
+        things_tags_str = things_todo.get('tags', '')
+        things_tags = set(t.strip() for t in things_tags_str.split(',') if t.strip()) if things_tags_str else set()
+
+        if md_tags != things_tags:
+            added_to_md = things_tags - md_tags
+            added_to_things = md_tags - things_tags
+            if added_to_md or added_to_things:
+                # Merge tags (union)
+                merged = md_tags | things_tags
+                if added_to_things:
+                    task_diffs.append({
+                        'field': 'tags',
+                        'action': 'MD → Things',
+                        'detail': f'Add tags to Things: {added_to_things}'
+                    })
+                    things_updates.append({'id': task['things_id'], 'field': 'add-tags', 'value': ','.join(added_to_things)})
+                if added_to_md:
+                    task_diffs.append({
+                        'field': 'tags',
+                        'action': 'MD ← Things',
+                        'detail': f'Add tags to MD: {added_to_md}'
+                    })
+                    md_updates.append({'task': task, 'field': 'tags', 'value': list(merged)})
+
+        # Compare deadline
+        md_deadline = task.get('deadline', '')
+        things_deadline = things_todo.get('deadline', '')
+        if md_deadline != things_deadline:
+            if md_deadline and not things_deadline:
+                task_diffs.append({
+                    'field': 'deadline',
+                    'action': 'MD → Things',
+                    'detail': f'Set deadline in Things: {md_deadline}'
+                })
+                things_updates.append({'id': task['things_id'], 'field': 'deadline', 'value': md_deadline})
+            elif things_deadline and not md_deadline:
+                task_diffs.append({
+                    'field': 'deadline',
+                    'action': 'MD ← Things',
+                    'detail': f'Set deadline in MD: {things_deadline}'
+                })
+                md_updates.append({'task': task, 'field': 'deadline', 'value': things_deadline})
+
+        # Compare when
+        md_when = task.get('when', '')
+        things_when = things_todo.get('when', '')
+        if md_when != things_when:
+            if md_when and not things_when:
+                task_diffs.append({
+                    'field': 'when',
+                    'action': 'MD → Things',
+                    'detail': f'Set when in Things: {md_when}'
+                })
+                things_updates.append({'id': task['things_id'], 'field': 'when', 'value': md_when})
+            elif things_when and not md_when:
+                task_diffs.append({
+                    'field': 'when',
+                    'action': 'MD ← Things',
+                    'detail': f'Set when in MD: {things_when}'
+                })
+                md_updates.append({'task': task, 'field': 'when', 'value': things_when})
+
+        if task_diffs:
+            diffs.append({
+                'task': task['title'],
+                'id': task['things_id'],
+                'changes': task_diffs
+            })
+
+# Find new tasks in Things not in MD
 for tid, todo in things_by_id.items():
     if tid not in matched_things_ids and todo.get('status') == 'open':
-        new_todos_for_md.append(todo)
-        actions.append(f"ADD TO MD: {todo['name']} ({tid})")
-        new_in_things += 1
+        new_in_md.append(todo)
+        diffs.append({
+            'task': todo['name'],
+            'id': tid,
+            'action': 'NEW_IN_MD',
+            'detail': 'Add to MD from Things'
+        })
 
-if not dry_run:
-    new_lines = lines.copy()
+# Find tasks in MD without Things ID that don't match any Things task
+new_in_things = []
+for task in md_tasks:
+    if not task['things_id'] and task['status'] != 'completed':
+        # Task not linked, not completed, and not matched by title
+        normalized_title = task['title'].strip().lower()
+        if normalized_title not in things_by_title:
+            new_in_things.append(task)
+            section = task.get('section', '')
+            defaults = get_section_defaults(section)
+            defaults_parts = []
+            if defaults.get('when'):
+                defaults_parts.append(f"when={defaults['when']}")
+            if defaults.get('tag'):
+                defaults_parts.append(f"tag={defaults['tag']}")
+            defaults_str = f" ({', '.join(defaults_parts)})" if defaults_parts else ""
+            diffs.append({
+                'task': task['title'],
+                'line_num': task['line_num'],
+                'action': 'NEW_IN_THINGS',
+                'detail': f'Create in Things from MD{defaults_str}'
+            })
 
-    for task in md_tasks:
-        if task.get('new_status') == 'completed':
-            old_line = new_lines[task['line_num']]
-            new_line = old_line.replace('- [ ]', '- [x]').replace('- [~]', '- [x]')
-            if 'done:' not in new_line:
-                new_line = new_line.rstrip() + f" `done:{date.today().strftime('%Y-%m')}`"
-            new_lines[task['line_num']] = new_line
+# Print diff report
+print("=" * 60)
+print("SYNC DIFF REPORT")
+print("=" * 60)
 
-    insertions = []
-    for task in md_tasks:
-        if task['things_id']:
-            has_id_line = False
-            for ln in task.get('notes_lines', []):
-                if things_id_pattern.match(lines[ln]):
-                    has_id_line = True
+if not diffs and not new_in_md:
+    print("\n✓ Everything is in sync!")
+else:
+    for diff in diffs:
+        print(f"\n📋 {diff['task']}")
+        if 'changes' in diff:
+            for change in diff['changes']:
+                arrow = "→" if "→" in change['action'] else "←"
+                print(f"   {change['field']}: {change['action']}")
+                print(f"      {change['detail']}")
+        elif diff.get('action') == 'LINK':
+            print(f"   🔗 {diff['detail']}")
+        elif diff.get('action') == 'NEW_IN_MD':
+            print(f"   ➕ {diff['detail']}")
+        elif diff.get('action') == 'NEW_IN_THINGS':
+            print(f"   🆕 {diff['detail']}")
+
+print("\n" + "-" * 60)
+print(f"Summary: {len(things_updates)} updates to Things, {len(md_updates)} updates to MD")
+print(f"         {len(new_in_md)} new in MD from Things, {len(new_in_things)} new in Things from MD")
+print("-" * 60)
+
+# Output update commands as JSON for bash to execute
+output = {
+    'things_updates': things_updates,
+    'md_updates': [{'line_num': u['task']['line_num'], 'field': u['field'], 'value': u['value'], 'title': u['task']['title']} for u in md_updates],
+    'new_in_md': [{'id': t['id'], 'name': t['name'], 'notes': t.get('notes', ''), 'tags': t.get('tags', ''), 'deadline': t.get('deadline', ''), 'when': t.get('when', '')} for t in new_in_md],
+    'new_in_things': [{
+        'line_num': t['line_num'],
+        'title': t['title'],
+        'notes': t.get('notes', ''),
+        'tags': t.get('tags', []),
+        'deadline': t.get('deadline', ''),
+        'when': t.get('when', ''),
+        'section': t.get('section', ''),
+        'section_defaults': get_section_defaults(t.get('section', ''))
+    } for t in new_in_things],
+    'md_tasks': [{'line_num': t['line_num'], 'things_id': t['things_id'], 'title': t['title'], 'notes_start': t['notes_start'], 'notes_end': t['notes_end']} for t in md_tasks if t['things_id'] and t['things_id'] not in [m['things_id'] for m in md_tasks if 'things_id' in m]],
+    'linked_ids': [(t['title'], t['things_id']) for t in md_tasks if t['things_id'] and t.get('needs_id_line', False)],
+    'dry_run': dry_run,
+    'auto_yes': auto_yes
+}
+
+# Check for tasks that need ID line added
+for task in md_tasks:
+    if task['things_id']:
+        # Check if there's already a things: line
+        has_id_line = False
+        for i in range(task['notes_start'], task['notes_end']):
+            if things_id_pattern.match(lines[i]):
+                has_id_line = True
+                break
+        if not has_id_line:
+            task['needs_id_line'] = True
+
+output['tasks_needing_id'] = [{'line_num': t['line_num'], 'things_id': t['things_id']} for t in md_tasks if t.get('needs_id_line')]
+
+print("\n__JSON_OUTPUT__")
+print(json.dumps(output))
+PYTHON_SYNC
+)
+
+    # Parse the output (macOS compatible)
+    local diff_report=$(echo "$sync_output" | sed '/__JSON_OUTPUT__/,$d')
+    local json_data=$(echo "$sync_output" | sed -n '/__JSON_OUTPUT__/,$ p' | tail -n +2)
+
+    echo "$diff_report"
+
+    if [ "$dry_run" = true ]; then
+        echo ""
+        echo "Dry run - no changes made."
+        json_response "true" "Dry run complete" "$json_data"
+        return 0
+    fi
+
+    # Check if there are any updates
+    local has_updates=$(echo "$json_data" | python3 -c "import json,sys; d=json.load(sys.stdin); print('yes' if d['things_updates'] or d['md_updates'] or d['new_in_md'] or d['new_in_things'] or d['tasks_needing_id'] else 'no')")
+
+    if [ "$has_updates" = "no" ]; then
+        echo ""
+        json_response "true" "Everything in sync" "$json_data"
+        return 0
+    fi
+
+    # Ask for confirmation unless -y flag
+    if [ "$auto_yes" != true ]; then
+        echo ""
+        read -p "Apply these changes? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            json_response "true" "Sync aborted by user" "$json_data"
+            return 0
+        fi
+    fi
+
+    # Apply Things updates
+    if [ -n "$auth_token" ]; then
+        echo "$json_data" | python3 -c "
+import json
+import sys
+import subprocess
+
+data = json.load(sys.stdin)
+for update in data['things_updates']:
+    task_id = update['id']
+    field = update['field']
+    value = update['value']
+
+    if field == 'completed':
+        cmd = ['$SCRIPT_DIR/things', 'todo', 'update', task_id, '--completed']
+    elif field == 'notes':
+        cmd = ['$SCRIPT_DIR/things', 'todo', 'update', task_id, '--notes', value]
+    elif field == 'add-tags':
+        cmd = ['$SCRIPT_DIR/things', 'todo', 'update', task_id, '--add-tags', value]
+    elif field == 'deadline':
+        cmd = ['$SCRIPT_DIR/things', 'todo', 'update', task_id, '--deadline', value]
+    elif field == 'when':
+        cmd = ['$SCRIPT_DIR/things', 'todo', 'update', task_id, '--when', value]
+    else:
+        continue
+
+    print(f'  Updating Things: {field} for {task_id}')
+    subprocess.run(cmd, capture_output=True)
+"
+    else
+        echo "Warning: No auth token - skipping Things updates"
+    fi
+
+    # Create new tasks in Things
+    local new_task_ids=""
+    new_task_ids=$(echo "$json_data" | python3 -c "
+import json
+import sys
+import subprocess
+import time
+
+data = json.load(sys.stdin)
+created_tasks = []
+
+for task in data.get('new_in_things', []):
+    title = task['title']
+    notes = task.get('notes', '')
+    tags = task.get('tags', [])
+    deadline = task.get('deadline', '')
+    when_date = task.get('when', '')
+    line_num = task['line_num']
+    section = task.get('section', '')
+    section_defaults = task.get('section_defaults', {})
+
+    # Apply section defaults if not explicitly set
+    if not when_date and section_defaults.get('when'):
+        when_date = section_defaults['when']
+
+    # Merge section tag with existing tags
+    section_tag = section_defaults.get('tag')
+    if section_tag:
+        if isinstance(tags, list):
+            if section_tag not in tags:
+                tags = tags + [section_tag]
+        else:
+            tags = [section_tag]
+
+    # Build command
+    cmd = ['$SCRIPT_DIR/things', 'todo', 'add', title, '--list', '$things_project']
+    if notes:
+        cmd.extend(['--notes', notes])
+    if tags:
+        tags_str = ','.join(tags) if isinstance(tags, list) else tags
+        if tags_str:
+            cmd.extend(['--tags', tags_str])
+    if deadline:
+        cmd.extend(['--deadline', deadline])
+    if when_date:
+        cmd.extend(['--when', when_date])
+
+    section_info = ' [' + section + ']' if section else ''
+    defaults_info = []
+    if section_defaults.get('when'):
+        defaults_info.append('when=' + section_defaults['when'])
+    if section_defaults.get('tag'):
+        defaults_info.append('tag=' + section_defaults['tag'])
+    defaults_str = ' (' + ', '.join(defaults_info) + ')' if defaults_info else ''
+    print('  Creating in Things: ' + title + section_info + defaults_str, file=sys.stderr)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    time.sleep(0.5)  # Give Things time to process
+
+    # Look up the new task by title to get its ID
+    lookup_script = '''
+        tell application "Things3"
+            try
+                set t to to do "''' + title.replace('"', chr(92) + '"') + '''"
+                return id of t
+            on error
+                return "NOT_FOUND"
+            end try
+        end tell
+    '''
+    lookup_cmd = ['osascript', '-e', lookup_script]
+    lookup_result = subprocess.run(lookup_cmd, capture_output=True, text=True)
+    new_id = lookup_result.stdout.strip()
+
+    if new_id and new_id != 'NOT_FOUND':
+        created_tasks.append({'line_num': line_num, 'things_id': new_id, 'title': title})
+        print('    -> Created with ID: ' + new_id, file=sys.stderr)
+    else:
+        print('    -> Warning: Could not get ID for ' + title, file=sys.stderr)
+
+# Output the created tasks as JSON for the MD update step
+print(json.dumps(created_tasks))
+" 2>&1 | tee >(grep -v '^\[' >&2) | grep '^\[')
+
+    # If we created new tasks, add their IDs to json_data for MD update
+    if [ -n "$new_task_ids" ] && [ "$new_task_ids" != "[]" ]; then
+        json_data=$(echo "$json_data" | python3 -c "
+import json
+import sys
+data = json.load(sys.stdin)
+new_ids = $new_task_ids
+data['created_tasks'] = new_ids
+print(json.dumps(data))
+")
+    fi
+
+    # Apply MD updates
+    python3 - "$json_data" "$tasks_file" << 'PYTHON_MD_UPDATE'
+import json
+import sys
+import re
+from pathlib import Path
+from datetime import date
+
+data = json.loads(sys.argv[1])
+tasks_file = Path(sys.argv[2])
+
+content = tasks_file.read_text()
+lines = content.split('\n')
+
+task_pattern = re.compile(r'^- \[([ x~])\] (.+)$')
+things_id_pattern = re.compile(r'^\s+- things:([A-Za-z0-9_-]+)\s*$')
+
+# Apply status updates
+for update in data['md_updates']:
+    line_num = update['line_num']
+    field = update['field']
+    value = update['value']
+
+    if field == 'status' and value == 'completed':
+        old_line = lines[line_num]
+        new_line = old_line.replace('- [ ]', '- [x]').replace('- [~]', '- [x]')
+        if 'done:' not in new_line:
+            new_line = new_line.rstrip() + f" `done:{date.today().strftime('%Y-%m')}`"
+        lines[line_num] = new_line
+        print(f'  Updated MD: status -> completed for line {line_num}')
+
+    elif field == 'notes':
+        # This is more complex - need to replace notes section
+        # For now, skip and let user update manually
+        print(f'  Note: notes update for "{update["title"]}" - manual update may be needed')
+
+    elif field == 'deadline':
+        old_line = lines[line_num]
+        if '`deadline:' not in old_line:
+            # Add deadline tag before any existing tags or at end
+            new_line = old_line.rstrip() + f" `deadline:{value}`"
+            lines[line_num] = new_line
+            print(f'  Updated MD: deadline -> {value} for line {line_num}')
+
+    elif field == 'when':
+        old_line = lines[line_num]
+        if '`when:' not in old_line:
+            new_line = old_line.rstrip() + f" `when:{value}`"
+            lines[line_num] = new_line
+            print(f'  Updated MD: when -> {value} for line {line_num}')
+
+# Add Things IDs to tasks that need them (linked by title match)
+insertions = []
+for task in data['tasks_needing_id']:
+    insertions.append((task['line_num'] + 1, f"  - things:{task['things_id']}"))
+
+# Add Things IDs to newly created tasks
+for task in data.get('created_tasks', []):
+    insertions.append((task['line_num'] + 1, f"  - things:{task['things_id']}"))
+
+insertions.sort(key=lambda x: x[0], reverse=True)
+for line_num, text in insertions:
+    lines.insert(line_num, text)
+    print(f'  Added Things ID at line {line_num}')
+
+# Add new tasks from Things
+if data['new_in_md']:
+    # Find insertion point (before ## Klart)
+    insert_idx = len(lines)
+    for idx, line in enumerate(lines):
+        if line.strip().lower() == '## klart':
+            insert_idx = idx
+            break
+        elif line.strip().lower() in ['## att göra', '## att gora', '## idéer', '## ideer']:
+            # Find end of this section
+            for j in range(idx + 1, len(lines)):
+                if lines[j].startswith('---') or lines[j].startswith('## '):
+                    insert_idx = j
                     break
 
-            if not has_id_line:
-                original_line = lines[task['line_num']]
-                search_start = content.find(original_line)
-                search_end = min(search_start + 500, len(content))
-                if f"things:{task['things_id']}" not in content[search_start:search_end]:
-                    insert_at = task['line_num'] + 1
-                    insertions.append((insert_at, f"  - things:{task['things_id']}"))
+    new_section = []
+    for todo in data['new_in_md']:
+        tags_str = ' '.join(f'`{t.strip()}`' for t in todo.get('tags', '').split(',') if t.strip())
+        deadline_str = f" `deadline:{todo['deadline']}`" if todo.get('deadline') else ''
+        when_str = f" `when:{todo['when']}`" if todo.get('when') else ''
 
-    insertions.sort(key=lambda x: x[0], reverse=True)
-    for line_num, text in insertions:
-        new_lines.insert(line_num, text)
+        new_section.append(f"- [ ] {todo['name']}{' ' + tags_str if tags_str else ''}{deadline_str}{when_str}")
+        new_section.append(f"  - things:{todo['id']}")
+        if todo.get('notes'):
+            for note_line in todo['notes'].replace('\\n', '\n').split('\n'):
+                if note_line.strip():
+                    new_section.append(f"  - {note_line.strip()}")
+        new_section.append("")
+        print(f'  Added new task from Things: {todo["name"]}')
 
-    if new_todos_for_md:
-        # Find "## Att göra" section or insert before "## Klart"
-        insert_idx = len(new_lines)
-        att_gora_idx = None
-        for idx, line in enumerate(new_lines):
-            if line.strip().lower() in ['## att göra', '## att gora']:
-                att_gora_idx = idx
-            elif line.strip().lower() == '## klart':
-                insert_idx = idx
-                break
-            elif att_gora_idx and line.startswith('---'):
-                # End of "Att göra" section
-                insert_idx = idx
-                break
+    if new_section:
+        lines = lines[:insert_idx] + [''] + new_section + lines[insert_idx:]
 
-        new_section = []
-        for todo in new_todos_for_md:
-            tags_str = ' '.join(f'`{t.strip()}`' for t in todo.get('tags', '').split(',') if t.strip())
-            new_section.append(f"- [ ] {todo['name']}{' ' + tags_str if tags_str else ''}")
-            new_section.append(f"  - things:{todo['id']}")
-            if todo.get('notes'):
-                for note_line in todo['notes'].split('\\n'):
-                    if note_line.strip():
-                        new_section.append(f"  - {note_line.strip()}")
-            new_section.append("")
+# Update sync timestamp
+for idx, line in enumerate(lines):
+    if line.startswith('**Senast synkad:**'):
+        lines[idx] = f"**Senast synkad:** {date.today().strftime('%Y-%m-%d')}"
+        break
 
-        if new_section:
-            new_lines = new_lines[:insert_idx] + [''] + new_section + new_lines[insert_idx:]
+tasks_file.write_text('\n'.join(lines))
+PYTHON_MD_UPDATE
 
-    tasks_file.write_text('\n'.join(new_lines))
-
-print("=== SYNC REPORT ===")
-for action in actions:
-    print(action)
-print()
-print(f"IDs linked: {ids_linked}")
-print(f"Status synced: {status_synced}")
-print(f"New in Things (added to MD): {new_in_things}")
-
-result = {
-    "ids_linked": ids_linked,
-    "status_synced": status_synced,
-    "new_in_things": new_in_things,
-    "dry_run": dry_run
-}
-print()
-print(json.dumps({"success": True, "message": "Sync complete", "data": result}))
-PYTHON_SYNC
+    echo ""
+    echo "✓ Sync complete!"
+    json_response "true" "Sync complete" "$json_data"
 }
 
 # =============================================================================
