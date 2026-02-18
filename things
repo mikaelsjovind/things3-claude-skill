@@ -629,6 +629,78 @@ cmd_sync() {
         exit 1
     }
 
+    # Look up completed tasks by ID from tasks.md
+    # Active project only returns open tasks — completed tasks move to Logbook
+    # We query each linked ID individually to catch status changes
+    local md_ids
+    md_ids=$(grep -oE 'things:[A-Za-z0-9_-]+' "$tasks_file" | sed 's/things://' | sort -u)
+
+    if [ -n "$md_ids" ]; then
+        # Build AppleScript to look up each ID
+        local id_lookup_script="tell application \"Things3\"
+            set output to \"[\"
+            set isFirst to true"
+
+        while IFS= read -r tid; do
+            id_lookup_script+="
+            try
+                set t to to do id \"$tid\"
+                set todoStatus to status of t as string
+                if todoStatus is \"completed\" or todoStatus is \"canceled\" then
+                    set todoName to name of t
+                    set todoNotes to notes of t
+                    set todoTags to tag names of t
+
+                    -- Escape quotes in name
+                    set AppleScript's text item delimiters to \"\\\"\"
+                    set todoName to text items of todoName
+                    set AppleScript's text item delimiters to \"\\\\\\\"\"
+                    set todoName to todoName as string
+                    -- Escape quotes in notes
+                    set AppleScript's text item delimiters to \"\\\"\"
+                    set todoNotes to text items of todoNotes
+                    set AppleScript's text item delimiters to \"\\\\\\\"\"
+                    set todoNotes to todoNotes as string
+                    set AppleScript's text item delimiters to \"\"
+                    -- Escape newlines in notes
+                    set AppleScript's text item delimiters to ASCII character 10
+                    set todoNotes to text items of todoNotes
+                    set AppleScript's text item delimiters to \"\\\\n\"
+                    set todoNotes to todoNotes as string
+                    set AppleScript's text item delimiters to \"\"
+
+                    if not isFirst then
+                        set output to output & \", \"
+                    end if
+                    set output to output & \"{\\\"id\\\": \\\"$tid\\\", \\\"name\\\": \\\"\" & todoName & \"\\\", \\\"notes\\\": \\\"\" & todoNotes & \"\\\", \\\"status\\\": \\\"\" & todoStatus & \"\\\", \\\"tags\\\": \\\"\" & todoTags & \"\\\", \\\"when\\\": \\\"\\\", \\\"deadline\\\": \\\"\\\"}\"
+                    set isFirst to false
+                end if
+            end try"
+        done <<< "$md_ids"
+
+        id_lookup_script+="
+            set output to output & \"]\"
+            return output
+        end tell"
+
+        local completed_result
+        completed_result=$(osascript -e "$id_lookup_script" 2>/dev/null) || completed_result="[]"
+
+        # Merge completed tasks into things_result using Python
+        things_result=$(python3 -c "
+import json, sys
+active = json.loads(sys.argv[1])
+data = active.get('data', [])
+active_ids = {t['id'] for t in data}
+completed = json.loads(sys.argv[2])
+for t in completed:
+    if t['id'] not in active_ids:
+        data.append(t)
+active['data'] = data
+print(json.dumps(active))
+" "$things_result" "$completed_result")
+    fi
+
     # Use Python for robust bidirectional sync logic
     local dry_run_py="False"
     [ "$dry_run" = true ] && dry_run_py="True"
